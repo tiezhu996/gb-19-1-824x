@@ -173,10 +173,23 @@ export const paymentApi = {
   reports: (params?: any) => get('/finance/reports', params),
 }
 
+export interface Refund {
+  id?: number
+  student_id: number
+  payment_id: number
+  amount: number
+  reason?: string
+  status?: 'pending' | 'approved' | 'rejected'
+  refund_date?: string
+  reject_reason?: string
+  payment?: Payment
+  student?: Student
+}
+
 export const refundApi = {
-  list: () => get('/refunds'),
-  create: (data: any) => post('/refunds', data),
-  process: (id: number, data: { status: string }) =>
+  list: (params?: any) => get('/refunds', params),
+  create: (data: Partial<Refund>) => post('/refunds', data),
+  process: (id: number, data: { status: 'approved' | 'rejected'; reject_reason?: string }) =>
     post(`/refunds/${id}/process`, data),
 }
 

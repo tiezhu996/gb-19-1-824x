@@ -146,17 +146,27 @@ type Payment struct {
 	Remarks       string    `json:"remarks" gorm:"type:text"`
 	Student       *Student  `json:"student,omitempty" gorm:"foreignKey:StudentID"`
 	Course        *Course   `json:"course,omitempty" gorm:"foreignKey:CourseID"`
+
+	// 退费账务汇总（非持久化，按退费单实时计算）
+	RefundedAmount  float64 `json:"refunded_amount" gorm:"-"`
+	PendingAmount   float64 `json:"pending_amount" gorm:"-"`
+	AvailableAmount float64 `json:"available_amount" gorm:"-"`
+	RefundStatus    string  `json:"refund_status" gorm:"-"` // none / partial / refunded
 }
 
 type Refund struct {
 	BaseModel
-	StudentID   uint      `json:"student_id" gorm:"index;not null"`
-	PaymentID   uint      `json:"payment_id" gorm:"index;not null"`
-	Amount      float64   `json:"amount" gorm:"type:decimal(10,2);not null"`
-	Reason      string    `json:"reason" gorm:"type:text"`
-	Status      string    `json:"status" gorm:"size:20;default:pending"`
-	RefundDate  *string   `json:"refund_date" gorm:"size:10"`
-	ProcessedBy *uint     `json:"processed_by" gorm:"index"`
+	StudentID    uint     `json:"student_id" gorm:"index;not null"`
+	PaymentID    uint     `json:"payment_id" gorm:"index;not null"`
+	Amount       float64  `json:"amount" gorm:"type:decimal(10,2);not null"`
+	Reason       string   `json:"reason" gorm:"type:text"`
+	Status       string   `json:"status" gorm:"size:20;default:pending"` // pending / approved / rejected
+	RefundDate   *string  `json:"refund_date" gorm:"size:10"`
+	ProcessedBy  *uint    `json:"processed_by" gorm:"index"`
+	RejectReason string   `json:"reject_reason" gorm:"type:text"`
+	Payment      *Payment `json:"payment,omitempty" gorm:"foreignKey:PaymentID"`
+	Student      *Student `json:"student,omitempty" gorm:"foreignKey:StudentID"`
+	Processor    *User    `json:"processor,omitempty" gorm:"foreignKey:ProcessedBy"`
 }
 
 type Performance struct {

@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: edu_train_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123456}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-edu_train}
+      MYSQL_USER: ${MYSQL_USER:-admin}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-admin123456}
+    ports:
+      - "${DB_PORT:-3402}:3306"
+    volumes:
+      - ${DB_VOLUME:-edu_train_db_data}:/var/lib/mysql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u${MYSQL_USER:-admin}", "-p${MYSQL_PASSWORD:-admin123456}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - edu_train_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: edu_train_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6405}:6379"
+    volumes:
+      - ${REDIS_VOLUME:-edu_train_redis_data}:/data
+    networks:
+      - edu_train_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: edu_train_backend
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-debug}
+      JWT_SECRET: ${JWT_SECRET:-your-very-long-secret-key-change-in-production}
+      JWT_EXPIRE_HOURS: ${JWT_EXPIRE_HOURS:-24}
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${MYSQL_DATABASE:-edu_train}
+      DB_USER: ${MYSQL_USER:-admin}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-admin123456}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DB: ${REDIS_DB:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${BACKEND_PORT:-3005}:3000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - edu_train_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: edu_train_frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8005}:80"
+    depends_on:
+      - backend
+    networks:
+      - edu_train_network
+
+networks:
+  edu_train_network:
+    driver: bridge
+
+volumes:
+  edu_train_db_data:
+    name: ${DB_VOLUME:-edu_train_db_data}
+  edu_train_redis_data:
+    name: ${REDIS_VOLUME:-edu_train_redis_data}

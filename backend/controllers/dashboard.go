@@ -37,8 +37,8 @@ func GetDashboardStats(c *gin.Context) {
 
 	var totalIncome float64
 	database.DB.Model(&models.Payment{}).
-		Select("COALESCE(SUM(amount), 0)").
-		Where("status = ? AND type = ? AND payment_date >= ?", "paid", "tuition", currentMonthStartStr).
+		Select("COALESCE(SUM(amount - refunded_amount), 0)").
+		Where("status IN ? AND type = ? AND payment_date >= ?", []string{"paid", "partial_refund", "refunded"}, "tuition", currentMonthStartStr).
 		Scan(&totalIncome)
 	stats["total_income"] = totalIncome
 

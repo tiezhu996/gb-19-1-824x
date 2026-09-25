@@ -133,19 +133,37 @@ type Attendance struct {
 	Student       *Student `json:"student,omitempty" gorm:"foreignKey:StudentID"`
 }
 
+// 缴费单状态
+const (
+	PaymentStatusPaid          = "paid"           // 已支付
+	PaymentStatusPartialRefund = "partial_refund" // 部分退款
+	PaymentStatusRefunded      = "refunded"       // 已退款
+)
+
+// 退费申请状态
+const (
+	RefundStatusPending  = "pending"  // 待审核
+	RefundStatusApproved = "approved" // 已通过
+	RefundStatusRejected = "rejected" // 已驳回
+)
+
 type Payment struct {
 	BaseModel
-	StudentID     uint      `json:"student_id" gorm:"index;not null"`
-	CourseID      *uint     `json:"course_id" gorm:"index"`
-	Amount        float64   `json:"amount" gorm:"type:decimal(10,2);not null"`
-	PaymentMethod string    `json:"payment_method" gorm:"size:20;not null"`
-	PaymentDate   string    `json:"payment_date" gorm:"size:10;not null"`
-	Type          string    `json:"type" gorm:"size:20;default:tuition"`
-	Status        string    `json:"status" gorm:"size:20;default:paid"`
-	ReceiptNo     string    `json:"receipt_no" gorm:"size:50;uniqueIndex"`
-	Remarks       string    `json:"remarks" gorm:"type:text"`
-	Student       *Student  `json:"student,omitempty" gorm:"foreignKey:StudentID"`
-	Course        *Course   `json:"course,omitempty" gorm:"foreignKey:CourseID"`
+	StudentID      uint      `json:"student_id" gorm:"index;not null"`
+	CourseID       *uint     `json:"course_id" gorm:"index"`
+	Amount         float64   `json:"amount" gorm:"type:decimal(10,2);not null"`
+	RefundedAmount float64   `json:"refunded_amount" gorm:"type:decimal(10,2);default:0"`
+	PaymentMethod  string    `json:"payment_method" gorm:"size:20;not null"`
+	PaymentDate    string    `json:"payment_date" gorm:"size:10;not null"`
+	Type           string    `json:"type" gorm:"size:20;default:tuition"`
+	Status         string    `json:"status" gorm:"size:20;default:paid"`
+	ReceiptNo      string    `json:"receipt_no" gorm:"size:50;uniqueIndex"`
+	Remarks        string    `json:"remarks" gorm:"type:text"`
+	Student        *Student  `json:"student,omitempty" gorm:"foreignKey:StudentID"`
+	Course         *Course   `json:"course,omitempty" gorm:"foreignKey:CourseID"`
+	// 非持久化字段，由退费流水实时汇总，用于对账展示
+	PendingRefundAmount float64 `json:"pending_refund_amount" gorm:"-"`
+	RefundableAmount    float64 `json:"refundable_amount" gorm:"-"`
 }
 
 type Refund struct {
@@ -157,6 +175,9 @@ type Refund struct {
 	Status      string    `json:"status" gorm:"size:20;default:pending"`
 	RefundDate  *string   `json:"refund_date" gorm:"size:10"`
 	ProcessedBy *uint     `json:"processed_by" gorm:"index"`
+	Student     *Student  `json:"student,omitempty" gorm:"foreignKey:StudentID"`
+	Payment     *Payment  `json:"payment,omitempty" gorm:"foreignKey:PaymentID"`
+	Processor   *User     `json:"processor,omitempty" gorm:"foreignKey:ProcessedBy"`
 }
 
 type Performance struct {

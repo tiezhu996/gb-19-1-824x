@@ -1,7 +1,9 @@
 package controllers
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -10,7 +12,82 @@ import (
 	"edu-train/utils"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+// errRefundValidation 退费业务校验失败（具体信息通过返回消息携带）
+var errRefundValidation = errors.New("refund validation failed")
+
+// lockForUpdate 在 MySQL 上加行锁，其他方言（如测试用 SQLite）直接忽略
+func lockForUpdate(tx *gorm.DB) *gorm.DB {
+	if tx.Dialector.Name() == "mysql" {
+		return tx.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	return tx
+}
+
+// roundMoney 金额保留两位小数，避免浮点误差影响对账
+func roundMoney(v float64) float64 {
+	return math.Round(v*100) / 100
+}
+
+// derivePaymentStatus 根据已退金额推导缴费单状态
+func derivePaymentStatus(amount, refunded float64) string {
+	refunded = roundMoney(refunded)
+	switch {
+	case refunded <= 0:
+		return models.PaymentStatusPaid
+	case refunded >= roundMoney(amount):
+		return models.PaymentStatusRefunded
+	default:
+		return models.PaymentStatusPartialRefund
+	}
+}
+
+// pendingRefundSum 统计缴费单待审核的退费总额（审批前占用可退额度）
+func pendingRefundSum(tx *gorm.DB, paymentID uint) (float64, error) {
+	var sum float64
+	err := tx.Model(&models.Refund{}).
+		Select("COALESCE(SUM(amount), 0)").
+		Where("payment_id = ? AND status = ?", paymentID, models.RefundStatusPending).
+		Scan(&sum).Error
+	return roundMoney(sum), err
+}
+
+// fillPaymentRefundInfo 填充缴费单的待审退费与剩余可退额度
+func fillPaymentRefundInfo(payments []models.Payment) {
+	if len(payments) == 0 {
+		return
+	}
+
+	ids := make([]uint, 0, len(payments))
+	for _, p := range payments {
+		ids = append(ids, p.ID)
+	}
+
+	type refundSum struct {
+		PaymentID uint
+		Total     float64
+	}
+	var sums []refundSum
+	database.DB.Model(&models.Refund{}).
+		Select("payment_id, COALESCE(SUM(amount), 0) AS total").
+		Where("payment_id IN ? AND status = ?", ids, models.RefundStatusPending).
+		Group("payment_id").
+		Scan(&sums)
+
+	pendingMap := make(map[uint]float64, len(sums))
+	for _, s := range sums {
+		pendingMap[s.PaymentID] = roundMoney(s.Total)
+	}
+
+	for i := range payments {
+		pending := pendingMap[payments[i].ID]
+		payments[i].PendingRefundAmount = pending
+		payments[i].RefundableAmount = roundMoney(payments[i].Amount - payments[i].RefundedAmount - pending)
+	}
+}
 
 func GetPayments(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -54,6 +131,8 @@ func GetPayments(c *gin.Context) {
 		return
 	}
 
+	fillPaymentRefundInfo(payments)
+
 	utils.Success(c, gin.H{
 		"list":  payments,
 		"total": total,
@@ -71,7 +150,10 @@ func GetPayment(c *gin.Context) {
 		return
 	}
 
-	utils.Success(c, payment)
+	payments := []models.Payment{payment}
+	fillPaymentRefundInfo(payments)
+
+	utils.Success(c, payments[0])
 }
 
 func CreatePayment(c *gin.Context) {
@@ -82,7 +164,7 @@ func CreatePayment(c *gin.Context) {
 	}
 
 	payment.ReceiptNo = generateReceiptNo()
-	payment.Status = "paid"
+	payment.Status = models.PaymentStatusPaid
 
 	if payment.Type == "" {
 		payment.Type = "tuition"
@@ -130,9 +212,21 @@ func UpdatePayment(c *gin.Context) {
 		return
 	}
 
+	// 已退金额、状态、收据号由退费流程统一维护，不允许直接修改
+	delete(updates, "refunded_amount")
+	delete(updates, "status")
+	delete(updates, "receipt_no")
+
 	if err := database.DB.Model(&payment).Updates(updates).Error; err != nil {
 		utils.InternalServerError(c, "更新失败")
 		return
+	}
+
+	// 金额变更后按已退金额重新推导缴费单状态
+	database.DB.First(&payment, id)
+	if status := derivePaymentStatus(payment.Amount, payment.RefundedAmount); status != payment.Status {
+		database.DB.Model(&payment).Update("status", status)
+		payment.Status = status
 	}
 
 	utils.Success(c, payment)
@@ -150,16 +244,61 @@ func DeletePayment(c *gin.Context) {
 }
 
 func CreateRefund(c *gin.Context) {
-	var refund models.Refund
-	if err := c.ShouldBindJSON(&refund); err != nil {
+	var req struct {
+		PaymentID uint    `json:"payment_id" binding:"required"`
+		Amount    float64 `json:"amount" binding:"required"`
+		Reason    string  `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
 		utils.BadRequest(c, "参数错误")
 		return
 	}
 
-	refund.Status = "pending"
+	req.Amount = roundMoney(req.Amount)
+	if req.Amount <= 0 {
+		utils.BadRequest(c, "退费金额必须大于0")
+		return
+	}
 
-	if err := database.DB.Create(&refund).Error; err != nil {
-		utils.InternalServerError(c, "创建退费申请失败")
+	var refund models.Refund
+	var errMsg string
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		// 锁定缴费单，保证“已退 + 待审 + 本次申请”的校验与写入是原子的
+		var payment models.Payment
+		if err := lockForUpdate(tx).First(&payment, req.PaymentID).Error; err != nil {
+			return err
+		}
+
+		pending, err := pendingRefundSum(tx, payment.ID)
+		if err != nil {
+			return err
+		}
+
+		refundable := roundMoney(payment.Amount - payment.RefundedAmount - pending)
+		if req.Amount > refundable {
+			errMsg = fmt.Sprintf("退费金额超出剩余可退额度，剩余可退 %.2f 元", refundable)
+			return errRefundValidation
+		}
+
+		refund = models.Refund{
+			StudentID: payment.StudentID,
+			PaymentID: payment.ID,
+			Amount:    req.Amount,
+			Reason:    req.Reason,
+			Status:    models.RefundStatusPending,
+		}
+		return tx.Create(&refund).Error
+	})
+
+	if err != nil {
+		switch {
+		case errors.Is(err, errRefundValidation):
+			utils.BadRequest(c, errMsg)
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			utils.NotFound(c, "缴费记录不存在")
+		default:
+			utils.InternalServerError(c, "创建退费申请失败")
+		}
 		return
 	}
 
@@ -167,8 +306,27 @@ func CreateRefund(c *gin.Context) {
 }
 
 func GetRefunds(c *gin.Context) {
+	status := c.Query("status")
+	paymentID := c.Query("payment_id")
+	studentID := c.Query("student_id")
+
+	query := database.DB.Model(&models.Refund{}).
+		Preload("Student").
+		Preload("Payment").
+		Preload("Processor")
+
+	if status != "" {
+		query = query.Where("status = ?", status)
+	}
+	if paymentID != "" {
+		query = query.Where("payment_id = ?", paymentID)
+	}
+	if studentID != "" {
+		query = query.Where("student_id = ?", studentID)
+	}
+
 	var refunds []models.Refund
-	if err := database.DB.Order("created_at DESC").Find(&refunds).Error; err != nil {
+	if err := query.Order("created_at DESC").Find(&refunds).Error; err != nil {
 		utils.InternalServerError(c, "查询失败")
 		return
 	}
@@ -189,22 +347,67 @@ func ProcessRefund(c *gin.Context) {
 		return
 	}
 
-	var refund models.Refund
-	if err := database.DB.First(&refund, id).Error; err != nil {
-		utils.NotFound(c, "退费申请不存在")
+	if req.Status != models.RefundStatusApproved && req.Status != models.RefundStatusRejected {
+		utils.BadRequest(c, "无效的审批状态")
 		return
 	}
 
-	refund.Status = req.Status
-	if req.Status == "approved" {
-		today := time.Now().Format("2006-01-02")
-		refund.RefundDate = &today
-	}
-	processedBy := userID.(uint)
-	refund.ProcessedBy = &processedBy
+	var refund models.Refund
+	var errMsg string
+	err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).First(&refund, id).Error; err != nil {
+			return err
+		}
 
-	if err := database.DB.Save(&refund).Error; err != nil {
-		utils.InternalServerError(c, "处理退费失败")
+		if refund.Status != models.RefundStatusPending {
+			errMsg = "该退费申请已处理，请勿重复操作"
+			return errRefundValidation
+		}
+
+		processedBy := userID.(uint)
+		refund.ProcessedBy = &processedBy
+		refund.Status = req.Status
+
+		if req.Status == models.RefundStatusApproved {
+			var payment models.Payment
+			if err := lockForUpdate(tx).First(&payment, refund.PaymentID).Error; err != nil {
+				return err
+			}
+
+			// 审批时再次校验可退额度，防止并发审批导致超额
+			refundable := roundMoney(payment.Amount - payment.RefundedAmount)
+			if refund.Amount > refundable {
+				errMsg = fmt.Sprintf("缴费单剩余可退额度不足，剩余可退 %.2f 元", refundable)
+				return errRefundValidation
+			}
+
+			// 累计已退金额并回写缴费单状态（部分退款/已退款）
+			payment.RefundedAmount = roundMoney(payment.RefundedAmount + refund.Amount)
+			payment.Status = derivePaymentStatus(payment.Amount, payment.RefundedAmount)
+			if err := tx.Model(&payment).Updates(map[string]interface{}{
+				"refunded_amount": payment.RefundedAmount,
+				"status":          payment.Status,
+			}).Error; err != nil {
+				return err
+			}
+
+			today := time.Now().Format("2006-01-02")
+			refund.RefundDate = &today
+		}
+		// 驳回仅更新状态，其占用的待审额度随之释放
+
+		return tx.Save(&refund).Error
+	})
+
+	if err != nil {
+		switch {
+		case errors.Is(err, errRefundValidation):
+			utils.BadRequest(c, errMsg)
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			utils.NotFound(c, "退费申请不存在")
+		default:
+			utils.InternalServerError(c, "处理退费失败")
+		}
 		return
 	}
 
@@ -231,8 +434,8 @@ func GetFinanceReports(c *gin.Context) {
 	}
 
 	query := database.DB.Model(&models.Payment{}).
-		Select(fmt.Sprintf("%s as period, SUM(amount) as total_income, COUNT(*) as payment_count, payment_method", groupBy)).
-		Where("status = ?", "paid")
+		Select(fmt.Sprintf("%s as period, SUM(amount - refunded_amount) as total_income, SUM(refunded_amount) as total_refund, COUNT(*) as payment_count, payment_method", groupBy)).
+		Where("status IN ?", []string{models.PaymentStatusPaid, models.PaymentStatusPartialRefund, models.PaymentStatusRefunded})
 
 	if startDate != "" {
 		query = query.Where("payment_date >= ?", startDate)
